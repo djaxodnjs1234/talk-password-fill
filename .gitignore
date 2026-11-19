@@ -1,0 +1,13 @@
+/.DS_Store
+.DS_Store
+/dist/
+/windows/bin/
+/windows/obj/
+__pycache__/
+*.app/
+*.p12
+*.pfx
+*.p8
+*.keychain
+*.keychain-db
+.env
