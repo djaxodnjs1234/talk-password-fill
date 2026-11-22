@@ -10,10 +10,10 @@ namespace TalkPasswordFill;
 internal sealed class KakaoAutofill(PasswordVault vault)
 {
     private readonly Dictionary<(int Id, DateTime Started), bool> signatureResults = new();
-    private Candidate? filled;
+    private FieldIdentity? filled;
     private int lastRetry;
 
-    internal string Scan(int retry, CancellationToken cancellation)
+    internal string Scan(int retry, bool manual, CancellationToken cancellation)
     {
         if (lastRetry != retry)
         {
@@ -21,7 +21,7 @@ internal sealed class KakaoAutofill(PasswordVault vault)
             filled = null;
         }
 
-        var found = new List<Candidate>();
+        var found = new List<LoginField>();
         var running = new HashSet<(int Id, DateTime Started)>();
         bool sawUnverifiedApp = false;
         bool sawVerifiedApp = false;
@@ -46,12 +46,17 @@ internal sealed class KakaoAutofill(PasswordVault vault)
                         sawUnverifiedApp = true;
                         continue;
                     }
+
                     sawVerifiedApp = true;
-                    found.AddRange(FindLoginFields(processKey.Id, processKey.StartTime));
+                    foreach (nint window in Native.VisibleWindows(process.Id))
+                    {
+                        LoginField? login = FindLoginField(window, process.Id, process.StartTime);
+                        if (login is not null) found.Add(login);
+                    }
                 }
                 catch (Exception error) when (error is Win32Exception or InvalidOperationException)
                 {
-                    // The target may exit between enumeration and inspection.
+                    // The target may exit between process enumeration and window inspection.
                 }
             }
         }
@@ -63,30 +68,22 @@ internal sealed class KakaoAutofill(PasswordVault vault)
         if (found.Count == 0)
         {
             filled = null;
-            if (sawVerifiedApp) return "Waiting for a supported KakaoTalk login window";
-            return sawUnverifiedApp ? "Could not verify KakaoTalk’s publisher" : "Waiting for KakaoTalk";
+            if (sawVerifiedApp) return "KakaoTalk is open. Waiting for a supported login window.";
+            return sawUnverifiedApp ? "Windows could not verify KakaoTalk’s Kakao Corp. signature." : "Start KakaoTalk to check autofill.";
         }
-        if (found.Count != 1) return "More than one KakaoTalk login field found";
+        if (found.Count != 1) return "More than one KakaoTalk login field is open. Close extra login windows.";
 
-        Candidate candidate = found[0];
-        if (filled == candidate) return "Already filled this login window";
-        int? length = Native.TextLength(candidate.Field);
-        if (length is null) return "KakaoTalk password field is unavailable";
-        if (length != 0) return "The password field already contains text";
-        if (cancellation.IsCancellationRequested) return "Autofill stopped";
+        LoginField candidate = found[0];
+        if (filled == candidate.Identity) return "Password filled for this login window. Click Log In in KakaoTalk.";
+        if (CheckReadiness(candidate, manual, cancellation) is string unavailable) return unavailable;
 
         char[] password = vault.Read();
         try
         {
-            if (!candidate.IsCurrent() || Native.TextLength(candidate.Field) != 0 || cancellation.IsCancellationRequested)
-            {
-                return "Waiting for an empty KakaoTalk password field";
-            }
-            if (!Native.SetText(candidate.Field, password) || Native.TextLength(candidate.Field) != password.Length - 1)
-            {
-                return "KakaoTalk did not accept autofill";
-            }
-            filled = candidate;
+            if (CheckReadiness(candidate, manual, cancellation) is string changed) return changed;
+            if (!candidate.Set(password)) return "KakaoTalk did not accept autofill on this login field.";
+
+            filled = candidate.Identity;
             return "Password filled. Click Log In in KakaoTalk.";
         }
         finally
@@ -95,45 +92,135 @@ internal sealed class KakaoAutofill(PasswordVault vault)
         }
     }
 
-    private static IEnumerable<Candidate> FindLoginFields(int pid, DateTime started)
+    private static string? CheckReadiness(LoginField candidate, bool manual, CancellationToken cancellation)
     {
-        foreach (nint window in Native.VisibleWindows(pid))
+        if (cancellation.IsCancellationRequested) return "Autofill stopped.";
+        if (!candidate.IsCurrent()) return "KakaoTalk’s password field changed.";
+        int? length = candidate.NativeHandle == 0 ? null : Native.TextLength(candidate.NativeHandle);
+        if (length > 0) return "The KakaoTalk password field already contains text.";
+        if (length is null && (!manual || candidate.Automation is null))
         {
-            string title = Native.WindowTitle(window).Trim();
-            bool namedLogin = IsLoginLabel(title) || title.Equals("KakaoTalk Login", StringComparison.OrdinalIgnoreCase) || title == "카카오톡 로그인";
-            bool namedApp = title.Equals("KakaoTalk", StringComparison.OrdinalIgnoreCase) || title == "카카오톡";
-            if (!namedLogin && !namedApp) continue;
-
-            var fields = Native.ChildWindows(window).Where(field => Native.IsPasswordEdit(field, window, pid)).Take(2).ToArray();
-            if (fields.Length == 1 && (namedLogin || HasLoginButton(window, pid)))
-            {
-                yield return new Candidate(window, fields[0], pid, started);
-            }
+            return candidate.Automation is null
+                ? "Windows could not verify that the KakaoTalk password field is empty."
+                : "Windows hides the field length. Clear the KakaoTalk field and choose Fill now.";
         }
+        return null;
     }
 
-    private static bool HasLoginButton(nint window, int pid)
+    internal static LoginField? FindLoginField(nint window, int pid, DateTime started)
     {
+        string title = Native.WindowTitle(window).Trim();
+        bool namedLogin = IsLoginLabel(title) ||
+            title.Equals("KakaoTalk Login", StringComparison.OrdinalIgnoreCase) ||
+            title.Equals("KakaoTalk - Login", StringComparison.OrdinalIgnoreCase) ||
+            title is "카카오톡 로그인" or "카카오톡 - 로그인";
+        bool namedApp = title.Equals("KakaoTalk", StringComparison.OrdinalIgnoreCase) || title == "카카오톡";
+        if (!namedLogin && !namedApp) return null;
+
+        nint[] edits = Native.ChildWindows(window).Where(field => Native.IsEditable(field, window, pid)).ToArray();
+        nint[] passwordEdits = edits.Where(Native.IsMasked).Take(2).ToArray();
+        if (passwordEdits.Length > 1) return null;
+
+        // The normal login view has one account field and one masked password field.
+        bool hasAccountAndPassword = edits.Length == 2 && passwordEdits.Length == 1;
+        if (passwordEdits.Length == 1 && (namedLogin || hasAccountAndPassword))
+        {
+            nint field = passwordEdits[0];
+            return new LoginField(new(pid, started, window, field.ToString()), field, null);
+        }
+
         try
         {
-            var root = AutomationElement.FromHandle(window);
+            AutomationElement root = AutomationElement.FromHandle(window);
+            bool hasLoginButton = namedLogin || HasLoginButton(root, pid);
+            if (!hasLoginButton) return null;
+            if (passwordEdits.Length == 1)
+            {
+                nint field = passwordEdits[0];
+                return new LoginField(new(pid, started, window, field.ToString()), field, null);
+            }
+
             var conditions = new AndCondition(
-                new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Button),
+                new PropertyCondition(AutomationElement.IsPasswordProperty, true),
                 new PropertyCondition(AutomationElement.ProcessIdProperty, pid));
-            return root.FindAll(TreeScope.Descendants, conditions).Cast<AutomationElement>()
-                .Any(button => !button.Current.IsOffscreen && IsLoginLabel(button.Current.Name));
+            var protectedFields = root.FindAll(TreeScope.Descendants, conditions).Cast<AutomationElement>()
+                .Where(element => element.Current.IsEnabled && !element.Current.IsOffscreen)
+                .Take(2).ToArray();
+            if (protectedFields.Length != 1) return null;
+            AutomationElement target = protectedFields[0];
+            if (!CanWrite(target, pid)) return null;
+
+            nint nativeHandle = (nint)(uint)target.Current.NativeWindowHandle;
+            if (!Native.IsEditable(nativeHandle, window, pid)) nativeHandle = 0;
+            return new LoginField(new(pid, started, window, string.Join(",", target.GetRuntimeId())), nativeHandle, target);
         }
         catch (Exception error) when (error is ElementNotAvailableException or COMException or InvalidOperationException or ArgumentException)
         {
-            return false;
+            return null;
         }
     }
 
+    private static bool HasLoginButton(AutomationElement root, int pid)
+    {
+        var conditions = new AndCondition(
+            new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Button),
+            new PropertyCondition(AutomationElement.ProcessIdProperty, pid));
+        return root.FindAll(TreeScope.Descendants, conditions).Cast<AutomationElement>()
+            .Any(button => !button.Current.IsOffscreen && IsLoginLabel(button.Current.Name));
+    }
+
+    private static bool CanWrite(AutomationElement target, int pid) =>
+        target.Current.ProcessId == pid && target.Current.IsPassword &&
+        target.Current.IsEnabled && !target.Current.IsOffscreen &&
+        target.TryGetCurrentPattern(ValuePattern.Pattern, out object? pattern) &&
+        pattern is ValuePattern value && !value.Current.IsReadOnly;
+
     internal static bool IsLoginLabel(string? title) => title?.Trim().ToLowerInvariant() is "로그인" or "login" or "log in" or "sign in";
 
-    private readonly record struct Candidate(nint Window, nint Field, int Pid, DateTime ProcessStart)
+    internal readonly record struct FieldIdentity(int Pid, DateTime ProcessStart, nint Window, string Control);
+
+    internal sealed record LoginField(FieldIdentity Identity, nint NativeHandle, AutomationElement? Automation)
     {
-        internal bool IsCurrent() => Native.IsPasswordEdit(Field, Window, Pid);
+        internal bool IsCurrent()
+        {
+            if (!Native.IsVisibleWindow(Identity.Window, Identity.Pid)) return false;
+            if (Automation is null)
+            {
+                return Native.IsEditable(NativeHandle, Identity.Window, Identity.Pid) && Native.IsMasked(NativeHandle);
+            }
+
+            try
+            {
+                return CanWrite(Automation, Identity.Pid) &&
+                    (NativeHandle == 0 || Native.IsEditable(NativeHandle, Identity.Window, Identity.Pid));
+            }
+            catch (Exception error) when (error is ElementNotAvailableException or COMException or InvalidOperationException)
+            {
+                return false;
+            }
+        }
+
+        internal bool Set(char[] password)
+        {
+            int expectedLength = password.Length - 1;
+            if (Automation is null)
+            {
+                return Native.SetText(NativeHandle, password) && Native.TextLength(NativeHandle) == expectedLength;
+            }
+
+            try
+            {
+                if (!Automation.TryGetCurrentPattern(ValuePattern.Pattern, out object? pattern) ||
+                    pattern is not ValuePattern value || value.Current.IsReadOnly) return false;
+                value.SetValue(new string(password, 0, expectedLength));
+                int? actualLength = NativeHandle == 0 ? null : Native.TextLength(NativeHandle);
+                return actualLength is null || actualLength == expectedLength;
+            }
+            catch (Exception error) when (error is ElementNotAvailableException or COMException or InvalidOperationException or ArgumentException)
+            {
+                return false;
+            }
+        }
     }
 }
 
@@ -142,6 +229,7 @@ internal static class Native
     private const int StyleIndex = -16;
     private const long PasswordStyle = 0x20;
     private const long ReadOnlyStyle = 0x800;
+    private const uint GetPasswordChar = 0x00D2;
     private const uint GetTextLength = 0x000E;
     private const uint SetTextMessage = 0x000C;
     private const uint AbortIfHung = 0x0002;
@@ -153,7 +241,7 @@ internal static class Native
         var windows = new List<nint>();
         EnumWindows((window, _) =>
         {
-            if (OwnsWindow(window, pid) && IsWindowVisible(window)) windows.Add(window);
+            if (IsVisibleWindow(window, pid)) windows.Add(window);
             return true;
         }, 0);
         return windows;
@@ -173,7 +261,10 @@ internal static class Native
         return buffer.ToString();
     }
 
-    internal static bool IsPasswordEdit(nint field, nint parent, int pid)
+    internal static bool IsVisibleWindow(nint window, int pid) =>
+        OwnsWindow(window, pid) && IsWindowVisible(window) && !IsIconic(window);
+
+    internal static bool IsEditable(nint field, nint parent, int pid)
     {
         if (!OwnsWindow(field, pid) || GetAncestor(field, RootAncestor) != parent ||
             !IsWindowVisible(field) || !IsWindowEnabled(field)) return false;
@@ -182,9 +273,11 @@ internal static class Native
         string fieldClass = buffer.ToString();
         if (!fieldClass.Equals("Edit", StringComparison.OrdinalIgnoreCase) &&
             !fieldClass.StartsWith("RichEdit", StringComparison.OrdinalIgnoreCase)) return false;
-        long style = GetWindowLongPtr(field, StyleIndex);
-        return (style & (PasswordStyle | ReadOnlyStyle)) == PasswordStyle;
+        return (GetWindowLongPtr(field, StyleIndex) & ReadOnlyStyle) == 0;
     }
+
+    internal static bool IsMasked(nint field) => (GetWindowLongPtr(field, StyleIndex) & PasswordStyle) != 0 ||
+        (SendMessageTimeout(field, GetPasswordChar, 0, 0, AbortIfHung | ErrorOnExit, 250, out nint mask) != 0 && mask != 0);
 
     internal static int? TextLength(nint field)
     {
@@ -212,6 +305,9 @@ internal static class Native
 
     [DllImport("user32.dll")]
     private static extern bool IsWindowVisible(nint window);
+
+    [DllImport("user32.dll")]
+    private static extern bool IsIconic(nint window);
 
     [DllImport("user32.dll")]
     private static extern bool IsWindowEnabled(nint window);

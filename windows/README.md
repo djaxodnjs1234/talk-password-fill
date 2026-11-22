@@ -1,6 +1,8 @@
-# Windows private preview
+# Windows preview
 
-Target platform: Windows 11 x64. Extract the ZIP to a permanent folder, run `TalkPasswordFill.exe`, save your own KakaoTalk password, and leave **Launch at Windows sign-in** enabled. Click **Log In** yourself when KakaoTalk shows the filled field.
+Target platform: Windows 11 x64. Quit any older copy of the helper, extract the entire ZIP to a permanent folder, and run `TalkPasswordFill.exe`. To keep an existing saved password, leave the password box blank and click **Save settings**. Select **Launch at Windows sign-in** to start the helper automatically.
+
+Launching the executable directly opens settings. When KakaoTalk displays a supported login window, the helper fills a password field it can confirm is empty. If the helper asks you to clear the password field, do so and click **Fill now** in settings. Click **Log In** yourself after checking the field.
 
 ## Verify on Windows
 
@@ -13,5 +15,5 @@ The preview was cross-built on macOS. The live KakaoTalk tests are pending. The 
 Build with the .NET 10 SDK from the repository root.
 
 ```powershell
-dotnet publish windows/TalkPasswordFill.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -o dist/windows-x64
+dotnet publish windows/TalkPasswordFill.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=false -o dist/windows-x64
 ```

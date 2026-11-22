@@ -1,6 +1,9 @@
 using Microsoft.Win32;
+using System.ComponentModel;
 using System.Drawing;
 using System.IO;
+using System.Runtime.InteropServices;
+using System.Security;
 using System.Security.Cryptography;
 using System.Windows.Forms;
 using Application = System.Windows.Forms.Application;
@@ -9,18 +12,52 @@ namespace TalkPasswordFill;
 
 internal static class Program
 {
-    [STAThread]
-    private static void Main()
-    {
-        using var running = new Mutex(true, @"Local\TalkPasswordFillPreview", out bool firstInstance);
-        if (!firstInstance)
-        {
-            return;
-        }
+    private const string InstanceName = @"Local\TalkPasswordFillPreview";
+    private const string RequestName = @"Local\TalkPasswordFill.ShowSettings";
 
-        ApplicationConfiguration.Initialize();
-        using var tray = new Tray();
-        Application.Run(tray);
+    [STAThread]
+    private static void Main(string[] args)
+    {
+        bool background = args.Contains("--background", StringComparer.Ordinal);
+        try
+        {
+            ApplicationConfiguration.Initialize();
+            Application.SetUnhandledExceptionMode(UnhandledExceptionMode.ThrowException);
+
+            using var running = new Mutex(true, InstanceName, out bool first);
+            if (!first)
+            {
+                if (!background && !RequestSettings())
+                {
+                    MessageBox.Show("An older Talk Password Fill is running. Quit it from the notification area or Task Manager, then open this version again.",
+                        "Talk Password Fill", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                }
+                return;
+            }
+
+            using var showRequest = new EventWaitHandle(false, EventResetMode.AutoReset, RequestName);
+            using var tray = new Tray(showRequest);
+            if (!background) tray.OpenSettings();
+            Application.Run(tray);
+        }
+        catch (Exception error)
+        {
+            MessageBox.Show($"Talk Password Fill could not start or stopped unexpectedly ({error.GetType().Name}). Extract the entire Windows ZIP to a folder before opening the app.",
+                "Talk Password Fill", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+    }
+
+    private static bool RequestSettings()
+    {
+        for (int attempt = 0; attempt < 5; attempt++)
+        {
+            if (EventWaitHandle.TryOpenExisting(RequestName, out EventWaitHandle? request))
+            {
+                using (request) return request.Set();
+            }
+            Thread.Sleep(80);
+        }
+        return false;
     }
 }
 
@@ -28,74 +65,99 @@ internal sealed class Tray : ApplicationContext
 {
     private readonly PasswordVault vault = new();
     private readonly KakaoAutofill autofill;
+    private readonly EventWaitHandle showRequest;
     private readonly ToolStripMenuItem status = new("Starting") { Enabled = false };
-    private readonly ToolStripMenuItem startup = new("Launch at Windows sign-in");
     private readonly ToolStripMenuItem pause = new("Pause autofill");
     private readonly ContextMenuStrip menu = new();
     private readonly NotifyIcon icon;
     private readonly System.Windows.Forms.Timer timer = new() { Interval = 1000 };
+    private SettingsForm? settings;
     private CancellationTokenSource? scan;
-    private bool isPaused;
-    private bool hasDialog;
+    private bool paused;
+    private bool fillRequested;
+    private bool closing;
     private int retry;
 
-    internal Tray()
+    internal Tray(EventWaitHandle showRequest)
     {
+        this.showRequest = showRequest;
         autofill = new KakaoAutofill(vault);
         icon = new NotifyIcon { Icon = SystemIcons.Shield, Text = "Talk Password Fill", Visible = true, ContextMenuStrip = menu };
         menu.Items.Add(status);
         menu.Items.Add(new ToolStripSeparator());
-        menu.Items.Add("Set or change password…", null, (_, _) => EditPassword());
-        menu.Items.Add("Fill again", null, (_, _) => { retry++; scan?.Cancel(); });
+        menu.Items.Add("Open settings", null, (_, _) => OpenSettings());
+        menu.Items.Add("Fill now", null, (_, _) => RequestFill());
         menu.Items.Add(pause);
-        menu.Items.Add(startup);
         menu.Items.Add("Delete saved password…", null, (_, _) => DeletePassword());
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add("Quit", null, (_, _) => ExitThread());
-        menu.Opening += (_, _) => startup.Checked = StartupRegistration.IsEnabled();
-        startup.Click += (_, _) => UpdateStartup(!StartupRegistration.IsEnabled());
         pause.Click += (_, _) =>
         {
-            isPaused = !isPaused;
-            pause.Text = isPaused ? "Resume autofill" : "Pause autofill";
+            paused = !paused;
+            pause.Text = paused ? "Resume autofill" : "Pause autofill";
             scan?.Cancel();
-            if (isPaused) ShowStatus("Autofill is paused");
+            ShowStatus(paused ? "Autofill is paused." : "Autofill resumed.");
         };
-        icon.DoubleClick += (_, _) => EditPassword();
+        icon.DoubleClick += (_, _) => OpenSettings();
         timer.Tick += Poll;
         timer.Start();
-        if (!vault.Exists)
-        {
-            Application.Idle += OnFirstRun;
-        }
+        ShowStatus(vault.Exists ? "Waiting for KakaoTalk…" : "Save a password to enable autofill.");
     }
 
-    private void OnFirstRun(object? sender, EventArgs args)
+    internal void OpenSettings()
     {
-        Application.Idle -= OnFirstRun;
-        EditPassword();
+        if (settings is null)
+        {
+            settings = new SettingsForm();
+            settings.Save.Click += (_, _) => SaveSettings();
+            settings.Fill.Click += (_, _) => RequestFill();
+            settings.FormClosing += (_, args) =>
+            {
+                if (args.CloseReason != CloseReason.UserClosing) return;
+                args.Cancel = true;
+                settings.Password.Clear();
+                settings.Hide();
+            };
+        }
+
+        if (!settings.Visible)
+        {
+            settings.Password.PlaceholderText = vault.Exists ? "Leave blank to keep the saved password" : "Enter your KakaoTalk password";
+            settings.Status.Text = status.Text;
+            settings.StartAtSignIn.Checked = StartupRegistration.HasEntry || !vault.Exists;
+            settings.Show();
+        }
+        settings.Activate();
     }
 
     private async void Poll(object? sender, EventArgs args)
     {
-        if (scan != null || isPaused || hasDialog) return;
+        if (showRequest.WaitOne(0)) OpenSettings();
+        if (scan != null || (paused && !fillRequested)) return;
         if (!vault.Exists)
         {
-            ShowStatus("Set your password to start");
+            fillRequested = false;
+            ShowStatus("Save a password to enable autofill.");
             return;
         }
 
         using var pending = new CancellationTokenSource();
         scan = pending;
+        bool manual = fillRequested;
+        fillRequested = false;
         int requestedRetry = retry;
         try
         {
-            string result = await Task.Run(() => autofill.Scan(requestedRetry, pending.Token));
-            if (!pending.IsCancellationRequested) ShowStatus(result);
+            string result = await Task.Run(() => autofill.Scan(requestedRetry, manual, pending.Token));
+            if (!closing && !pending.IsCancellationRequested) ShowStatus(result);
         }
-        catch (Exception error) when (error is IOException or UnauthorizedAccessException or CryptographicException)
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException or CryptographicException or SecurityException)
         {
-            if (!pending.IsCancellationRequested) ShowStatus("Could not access the saved password");
+            if (!closing && !pending.IsCancellationRequested) ShowStatus("Could not access the saved password. Save it again in this app.");
+        }
+        catch (Exception error) when (error is Win32Exception or COMException or InvalidOperationException)
+        {
+            if (!closing && !pending.IsCancellationRequested) ShowStatus($"Windows could not inspect the KakaoTalk window ({error.GetType().Name}).");
         }
         finally
         {
@@ -106,72 +168,90 @@ internal sealed class Tray : ApplicationContext
     private void ShowStatus(string message)
     {
         status.Text = message;
-        icon.Text = message;
+        if (settings is not null) settings.Status.Text = message;
     }
 
-    private void EditPassword()
+    private void RequestFill()
     {
-        if (hasDialog) return;
-        hasDialog = true;
+        if (!vault.Exists)
+        {
+            OpenSettings();
+            ShowStatus("Save a password before using Fill now.");
+            return;
+        }
+        retry++;
+        fillRequested = true;
+        scan?.Cancel();
+        ShowStatus("Checking the KakaoTalk login window…");
+    }
+
+    private void SaveSettings()
+    {
+        if (settings is null) return;
+        string password = settings.Password.Text;
+        if ((password.Length == 0 && !vault.Exists) || password.Contains('\0'))
+        {
+            ShowStatus("Enter your KakaoTalk password first.");
+            settings.Password.Focus();
+            return;
+        }
+
         scan?.Cancel();
         try
         {
-            using var dialog = new PasswordDialog(!vault.Exists || StartupRegistration.IsEnabled());
-            if (dialog.ShowDialog() != DialogResult.OK) return;
-            vault.Save(dialog.Password.Text);
-            UpdateStartup(dialog.StartAtSignIn.Checked);
+            if (password.Length > 0)
+            {
+                vault.Save(password);
+                settings.Password.Clear();
+                settings.Password.PlaceholderText = "Leave blank to keep the saved password";
+            }
             retry++;
+            try
+            {
+                StartupRegistration.SetEnabled(settings.StartAtSignIn.Checked);
+                ShowStatus("Settings saved. Open the KakaoTalk login window to check autofill.");
+            }
+            catch (Exception error) when (error is IOException or UnauthorizedAccessException or InvalidOperationException or SecurityException)
+            {
+                ShowStatus("Password saved. The Windows sign-in setting could not be changed.");
+            }
         }
-        catch (Exception error) when (error is IOException or UnauthorizedAccessException or CryptographicException)
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException or CryptographicException or SecurityException)
         {
-            MessageBox.Show("Could not save your password on this PC.", "Talk Password Fill");
-        }
-        finally
-        {
-            hasDialog = false;
+            ShowStatus("Could not save your password on this PC.");
         }
     }
 
     private void DeletePassword()
     {
-        if (hasDialog) return;
-        hasDialog = true;
+        if (MessageBox.Show("Delete the password saved on this PC?", "Talk Password Fill",
+            MessageBoxButtons.OKCancel, MessageBoxIcon.Question) != DialogResult.OK) return;
         scan?.Cancel();
+        fillRequested = false;
         try
         {
-            if (MessageBox.Show("Delete the password saved on this PC?", "Talk Password Fill",
-                MessageBoxButtons.OKCancel, MessageBoxIcon.Question) != DialogResult.OK) return;
             vault.Delete();
-            UpdateStartup(false);
+            StartupRegistration.SetEnabled(false);
+            if (settings is not null)
+            {
+                settings.Password.Clear();
+                settings.Password.PlaceholderText = "Enter your KakaoTalk password";
+                settings.StartAtSignIn.Checked = false;
+            }
+            ShowStatus("Saved password deleted.");
         }
-        catch (Exception error) when (error is IOException or UnauthorizedAccessException)
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException or SecurityException)
         {
-            MessageBox.Show("Could not delete your saved password.", "Talk Password Fill");
-        }
-        finally
-        {
-            hasDialog = false;
-        }
-    }
-
-    private void UpdateStartup(bool enabled)
-    {
-        try
-        {
-            StartupRegistration.SetEnabled(enabled);
-            startup.Checked = enabled;
-        }
-        catch (Exception error) when (error is IOException or UnauthorizedAccessException or InvalidOperationException)
-        {
-            MessageBox.Show("Could not update Windows startup. Keep the app running to enable autofill.", "Talk Password Fill");
+            ShowStatus("Could not complete password removal or update Windows startup.");
         }
     }
 
     protected override void ExitThreadCore()
     {
-        Application.Idle -= OnFirstRun;
+        closing = true;
         timer.Stop();
         scan?.Cancel();
+        settings?.Dispose();
         icon.Visible = false;
         icon.Dispose();
         timer.Dispose();
@@ -180,42 +260,39 @@ internal sealed class Tray : ApplicationContext
     }
 }
 
-internal sealed class PasswordDialog : Form
+internal sealed class SettingsForm : Form
 {
-    internal TextBox Password { get; } = new() { UseSystemPasswordChar = true, MaxLength = 512, Dock = DockStyle.Fill, AccessibleName = "KakaoTalk password" };
+    internal TextBox Password { get; } = new() { UseSystemPasswordChar = true, MaxLength = 512, Dock = DockStyle.Top, AccessibleName = "KakaoTalk password" };
     internal CheckBox StartAtSignIn { get; } = new() { Text = "Launch at Windows sign-in", AutoSize = true };
+    internal Button Save { get; } = new() { Text = "Save settings", AutoSize = true };
+    internal Button Fill { get; } = new() { Text = "Fill now", AutoSize = true };
+    internal Label Status { get; } = new() { Dock = DockStyle.Fill, AccessibleName = "Autofill status" };
 
-    internal PasswordDialog(bool launchAtSignIn)
+    internal SettingsForm()
     {
-        Text = "Set KakaoTalk password";
+        Text = "Talk Password Fill";
+        Icon = SystemIcons.Shield;
         Font = SystemFonts.MessageBoxFont!;
         AutoScaleMode = AutoScaleMode.Dpi;
-        ClientSize = new Size(392, 156);
-        FormBorderStyle = FormBorderStyle.FixedDialog;
-        MaximizeBox = MinimizeBox = false;
+        ClientSize = new Size(450, 248);
+        MinimumSize = new Size(420, 280);
+        MaximizeBox = false;
         StartPosition = FormStartPosition.CenterScreen;
-        StartAtSignIn.Checked = launchAtSignIn;
+        AcceptButton = Save;
 
-        var save = new Button { Text = "Save", AutoSize = true };
-        var cancel = new Button { Text = "Cancel", AutoSize = true, DialogResult = DialogResult.Cancel };
-        save.Click += (_, _) =>
-        {
-            if (Password.TextLength == 0 || Password.Text.Contains('\0'))
-            {
-                Password.Focus();
-                return;
-            }
-            DialogResult = DialogResult.OK;
-        };
-        AcceptButton = save;
-        CancelButton = cancel;
-        var buttons = new FlowLayoutPanel { AutoSize = true, Dock = DockStyle.Fill, FlowDirection = FlowDirection.RightToLeft };
-        buttons.Controls.AddRange([cancel, save]);
-        var grid = new TableLayoutPanel { Dock = DockStyle.Fill, Padding = new Padding(16), ColumnCount = 1, RowCount = 4 };
-        grid.Controls.Add(new Label { Text = "KakaoTalk password", AutoSize = true });
+        var actions = new FlowLayoutPanel { AutoSize = true, Dock = DockStyle.Top };
+        actions.Controls.AddRange([Save, Fill]);
+        var grid = new TableLayoutPanel { Dock = DockStyle.Fill, Padding = new Padding(16), ColumnCount = 1, RowCount = 6 };
+        for (int row = 0; row < 5; row++) grid.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        grid.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        grid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        grid.Controls.Add(new Label { Text = "Save your KakaoTalk password in this window.", AutoSize = true });
         grid.Controls.Add(Password);
         grid.Controls.Add(StartAtSignIn);
-        grid.Controls.Add(buttons);
+        grid.Controls.Add(actions);
+        grid.Controls.Add(new Label { Text = "Use Fill now only with an empty KakaoTalk password field.", AutoSize = true });
+        Status.Padding = new Padding(3, 12, 3, 0);
+        grid.Controls.Add(Status);
         Controls.Add(grid);
     }
 
@@ -231,10 +308,13 @@ internal static class StartupRegistration
     private const string RunKey = @"Software\Microsoft\Windows\CurrentVersion\Run";
     private const string Entry = "TalkPasswordFillPreview";
 
-    internal static bool IsEnabled()
+    internal static bool HasEntry
     {
-        using var run = Registry.CurrentUser.OpenSubKey(RunKey);
-        return string.Equals(run?.GetValue(Entry) as string, Command(), StringComparison.OrdinalIgnoreCase);
+        get
+        {
+            using var run = Registry.CurrentUser.OpenSubKey(RunKey);
+            return run?.GetValue(Entry) is string { Length: > 0 };
+        }
     }
 
     internal static void SetEnabled(bool enabled)
@@ -242,12 +322,11 @@ internal static class StartupRegistration
         using var run = Registry.CurrentUser.CreateSubKey(RunKey);
         if (enabled)
         {
-            string command = Command();
+            string path = Environment.ProcessPath ?? throw new InvalidOperationException("The executable path is unavailable.");
+            string command = $"\"{path}\" --background";
             if (command.Length > 260) throw new InvalidOperationException("Use a shorter install path.");
             run.SetValue(Entry, command);
         }
         else run.DeleteValue(Entry, throwOnMissingValue: false);
     }
-
-    private static string Command() => $"\"{Environment.ProcessPath ?? throw new InvalidOperationException()}\"";
 }
