@@ -118,6 +118,10 @@ internal sealed class KakaoAutofill(PasswordVault vault)
         if (!namedLogin && !namedApp) return null;
 
         nint[] edits = Native.ChildWindows(window).Where(field => Native.IsEditable(field, window, pid)).ToArray();
+        if (namedApp && FindKakaoLoginEdit(window, pid) is { } loginEdit)
+        {
+            return new LoginField(new(pid, started, window, loginEdit.ToString()), loginEdit, null, KakaoLoginLayout: true);
+        }
         nint[] passwordEdits = edits.Where(Native.IsMasked).Take(2).ToArray();
         if (passwordEdits.Length > 1) return null;
 
@@ -160,6 +164,23 @@ internal sealed class KakaoAutofill(PasswordVault vault)
         }
     }
 
+    private static nint? FindKakaoLoginEdit(nint window, int pid)
+    {
+        // KakaoTalk paints a placeholder while its standard password edit is hidden.
+        // Match the login view by its host class, account control ID, and two edit controls.
+        if (Native.WindowClass(window) != "EVA_Window" ||
+            Native.WindowTitle(window).Trim() is not ("KakaoTalk" or "카카오톡")) return null;
+
+        nint[] loginEdits = Native.ChildWindows(window)
+            .Where(field => Native.IsEditable(field, window, pid, includeHidden: true)).Take(3).ToArray();
+        if (loginEdits.Length != 2) return null;
+
+        nint account = Array.Find(loginEdits, field => Native.ControlId(field) == 1060 && !Native.IsMasked(field));
+        if (account == 0) return null;
+        nint password = loginEdits[0] == account ? loginEdits[1] : loginEdits[0];
+        return Native.IsMasked(password) && (Native.IsVisible(account) || Native.IsVisible(password)) ? password : null;
+    }
+
     private static bool HasLoginButton(AutomationElement root, int pid)
     {
         var conditions = new AndCondition(
@@ -179,11 +200,12 @@ internal sealed class KakaoAutofill(PasswordVault vault)
 
     internal readonly record struct FieldIdentity(int Pid, DateTime ProcessStart, nint Window, string Control);
 
-    internal sealed record LoginField(FieldIdentity Identity, nint NativeHandle, AutomationElement? Automation)
+    internal sealed record LoginField(FieldIdentity Identity, nint NativeHandle, AutomationElement? Automation, bool KakaoLoginLayout = false)
     {
         internal bool IsCurrent()
         {
             if (!Native.IsVisibleWindow(Identity.Window, Identity.Pid)) return false;
+            if (KakaoLoginLayout) return FindKakaoLoginEdit(Identity.Window, Identity.Pid) == NativeHandle;
             if (Automation is null)
             {
                 return Native.IsEditable(NativeHandle, Identity.Window, Identity.Pid) && Native.IsMasked(NativeHandle);
@@ -264,13 +286,21 @@ internal static class Native
     internal static bool IsVisibleWindow(nint window, int pid) =>
         OwnsWindow(window, pid) && IsWindowVisible(window) && !IsIconic(window);
 
-    internal static bool IsEditable(nint field, nint parent, int pid)
+    internal static string WindowClass(nint window)
+    {
+        var buffer = new StringBuilder(64);
+        return GetClassName(window, buffer, buffer.Capacity) != 0 ? buffer.ToString() : string.Empty;
+    }
+
+    internal static int ControlId(nint window) => GetDlgCtrlID(window);
+
+    internal static bool IsVisible(nint window) => IsWindowVisible(window);
+
+    internal static bool IsEditable(nint field, nint parent, int pid, bool includeHidden = false)
     {
         if (!OwnsWindow(field, pid) || GetAncestor(field, RootAncestor) != parent ||
-            !IsWindowVisible(field) || !IsWindowEnabled(field)) return false;
-        var buffer = new StringBuilder(64);
-        if (GetClassName(field, buffer, buffer.Capacity) == 0) return false;
-        string fieldClass = buffer.ToString();
+            (!includeHidden && !IsWindowVisible(field)) || !IsWindowEnabled(field)) return false;
+        string fieldClass = WindowClass(field);
         if (!fieldClass.Equals("Edit", StringComparison.OrdinalIgnoreCase) &&
             !fieldClass.StartsWith("RichEdit", StringComparison.OrdinalIgnoreCase)) return false;
         return (GetWindowLongPtr(field, StyleIndex) & ReadOnlyStyle) == 0;
@@ -311,6 +341,9 @@ internal static class Native
 
     [DllImport("user32.dll")]
     private static extern bool IsWindowEnabled(nint window);
+
+    [DllImport("user32.dll")]
+    private static extern int GetDlgCtrlID(nint window);
 
     [DllImport("user32.dll")]
     private static extern uint GetWindowThreadProcessId(nint window, out int processId);

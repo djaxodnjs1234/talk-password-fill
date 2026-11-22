@@ -10,7 +10,9 @@ Launching the executable directly opens settings. When KakaoTalk displays a supp
 2. Sign into KakaoTalk, log out, and confirm that the new login window fills again.
 3. Confirm the helper leaves existing text alone and pauses from the tray menu.
 
-The preview was cross-built on macOS. The live KakaoTalk tests are pending. The executable is unsigned and may show a SmartScreen prompt. The password is encrypted at rest with per-user DPAPI.
+Automated checks on Windows verified startup, reopening settings, and filling the first login window of official KakaoTalk with a test password. KakaoTalk may display the masked characters only after you click the password field. Validation on a Windows 11 PC after reboot and after signing out of a KakaoTalk account is pending.
+
+The executable is unsigned and may show a SmartScreen prompt. The password is encrypted at rest with per-user DPAPI.
 
 Build with the .NET 10 SDK from the repository root.
 
