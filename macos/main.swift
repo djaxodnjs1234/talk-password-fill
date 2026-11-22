@@ -26,7 +26,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     private let deleteItem = NSMenuItem(title: "Delete Saved Password", action: #selector(deletePassword), keyEquivalent: "")
     private let loginItem = NSMenuItem(title: "Launch at Mac Login", action: #selector(toggleLoginItem), keyEquivalent: "")
     private var scanToken: ScanToken?
-    private var timer: Timer?
+    private var needsScan = false
+    private var fallbackTimer: Timer?
+    private var windowObserver: AXObserver?
+    private var observedTarget: KakaoTarget?
     private var retryGeneration = 0
     private var registered = false
     private var showingDialog = false
@@ -35,7 +38,12 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     func applicationDidFinishLaunching(_ notification: Notification) {
         configureMenu()
         registered = store.exists()
-        timer = Timer.scheduledTimer(timeInterval: 1.2, target: self, selector: #selector(poll), userInfo: nil, repeats: true)
+        let notifications = NSWorkspace.shared.notificationCenter
+        for name in [NSWorkspace.didLaunchApplicationNotification, NSWorkspace.didTerminateApplicationNotification,
+                     NSWorkspace.didActivateApplicationNotification, NSWorkspace.didUnhideApplicationNotification] {
+            notifications.addObserver(self, selector: #selector(kakaoChanged(_:)), name: name, object: nil)
+        }
+        notifications.addObserver(self, selector: #selector(poll), name: NSWorkspace.didWakeNotification, object: nil)
         poll()
         if !registered {
             DispatchQueue.main.async { [weak self] in self?.editPassword() }
@@ -48,7 +56,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        timer?.invalidate()
+        stopWatching()
+        NSWorkspace.shared.notificationCenter.removeObserver(self)
         scanToken?.cancel()
     }
 
@@ -99,22 +108,85 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         return !showingDialog
     }
 
+    @objc private func kakaoChanged(_ notification: Notification) {
+        guard let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
+              app.bundleIdentifier == KakaoTarget.bundleID else { return }
+        poll()
+    }
+
+    private func stopWatching() {
+        fallbackTimer?.invalidate()
+        fallbackTimer = nil
+        if let windowObserver {
+            CFRunLoopRemoveSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(windowObserver), .commonModes)
+        }
+        windowObserver = nil
+        observedTarget = nil
+    }
+
+    private func watchWindows(of target: KakaoTarget, trusted: Bool) {
+        if fallbackTimer == nil {
+            let timer = Timer(timeInterval: 12, target: self, selector: #selector(poll), userInfo: nil, repeats: true)
+            timer.tolerance = 2
+            RunLoop.main.add(timer, forMode: .default)
+            fallbackTimer = timer
+        }
+        guard trusted, observedTarget != target else { return }
+        if let windowObserver {
+            CFRunLoopRemoveSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(windowObserver), .commonModes)
+        }
+        windowObserver = nil
+        var observer: AXObserver?
+        let created = AXObserverCreate(target.pid, { _, _, _, context in
+            guard let context else { return }
+            MainActor.assumeIsolated {
+                Unmanaged<AppDelegate>.fromOpaque(context).takeUnretainedValue().poll()
+            }
+        }, &observer)
+        guard created == .success, let observer else { return }
+
+        let app = AXUIElementCreateApplication(target.pid)
+        AXUIElementSetMessagingTimeout(app, 0.2)
+        let context = Unmanaged.passUnretained(self).toOpaque()
+        let registered = [kAXWindowCreatedNotification, kAXFocusedWindowChangedNotification, kAXMainWindowChangedNotification]
+            .map { AXObserverAddNotification(observer, app, $0 as CFString, context) }
+            .contains(.success)
+        guard registered else { return }
+        windowObserver = observer
+        observedTarget = target
+        CFRunLoopAddSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(observer), .commonModes)
+    }
+
     @objc private func poll() {
         guard !showingDialog else { return }
-        guard registered else { return showStatus(.noPassword) }
+        guard registered else {
+            stopWatching()
+            return showStatus(.noPassword)
+        }
         guard !paused else {
+            stopWatching()
             statusLine.title = "Autofill is paused"
             return
         }
-        guard AXIsProcessTrusted() else { return showStatus(.permissionNeeded) }
-        guard scanToken == nil else { return }
-
-        let app = NSWorkspace.shared.runningApplications.first {
-            $0.bundleIdentifier == KakaoTarget.bundleID && $0.isFinishedLaunching && !$0.isTerminated
+        let trusted = AXIsProcessTrusted()
+        let app = NSRunningApplication.runningApplications(withBundleIdentifier: KakaoTarget.bundleID)
+            .first { !$0.isTerminated }
+        guard let app else {
+            scanToken?.cancel()
+            stopWatching()
+            return showStatus(trusted ? .waitingForApp : .permissionNeeded)
         }
-        let target = app.map { KakaoTarget(pid: $0.processIdentifier, launchDate: $0.launchDate) }
+        let target = KakaoTarget(pid: app.processIdentifier, launchDate: app.launchDate)
+        watchWindows(of: target, trusted: trusted)
+        guard trusted else { return showStatus(.permissionNeeded) }
+        guard scanToken == nil else {
+            needsScan = true
+            return
+        }
+
         let token = ScanToken()
         scanToken = token
+        needsScan = false
         let retry = retryGeneration
         queue.async { [autofill, weak self] in
             let status = autofill.scan(target: target, retry: retry, isCancelled: { token.isCancelled })
@@ -125,8 +197,12 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
                     self.poll()
                     return
                 }
-                if status == .noPassword { self.registered = false }
+                if status == .noPassword {
+                    self.registered = false
+                    self.stopWatching()
+                }
                 self.showStatus(status)
+                if self.needsScan { self.poll() }
             }
         }
     }

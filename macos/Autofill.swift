@@ -46,6 +46,8 @@ enum FillStatus: String, Sendable {
     case permissionNeeded = "Accessibility permission is required"
     case keychainUnavailable = "Could not access Keychain"
     case fieldUnavailable = "KakaoTalk’s password field is unavailable"
+    case waitingForFocus = "Bring KakaoTalk’s login window to the front"
+    case editingUnavailable = "Could not edit KakaoTalk’s password field"
 }
 
 // Each instance is used by one serial queue.
@@ -105,6 +107,7 @@ final class Autofill: @unchecked Sendable {
               AXUIElementIsAttributeSettable(field, kAXValueAttribute as CFString, &settable) == .success,
               settable.boolValue else { return .fieldUnavailable }
         if let previous = filledField, CFEqual(previous, field) { return .alreadyFilled }
+        guard focusedWindow(window, in: app) else { return .waitingForFocus }
         guard let empty = isEmpty(field) else { return .fieldUnavailable }
         guard empty else { return .hasInput }
 
@@ -116,11 +119,38 @@ final class Autofill: @unchecked Sendable {
             return .keychainUnavailable
         }
 
-        guard isEmpty(field) == true, !isCancelled() else { return .fieldUnavailable }
-        let result = AXUIElementSetAttributeValue(field, kAXValueAttribute as CFString, password as CFString)
-        guard result == .success else { return .fieldUnavailable }
+        let result = fill(password, in: field, window: window, app: app, isCancelled: isCancelled)
+        guard result == .filled else { return result }
         filledField = field
         return .filled
+    }
+
+    func fill(_ password: String, in field: AXUIElement, window: AXUIElement, app: AXUIElement,
+              isCancelled: () -> Bool) -> FillStatus {
+        guard !isCancelled(), isEmpty(field) == true else { return .fieldUnavailable }
+        guard focusedWindow(window, in: app) else { return .waitingForFocus }
+
+        if !sameElement(field, in: app, attribute: kAXFocusedUIElementAttribute) {
+            let focus = AXUIElementSetAttributeValue(field, kAXFocusedAttribute as CFString, kCFBooleanTrue)
+            guard focus == .success else { return .editingUnavailable }
+        }
+        guard focusedWindow(window, in: app),
+              sameElement(field, in: app, attribute: kAXFocusedUIElementAttribute) else { return .waitingForFocus }
+        guard isEmpty(field) == true, !isCancelled() else { return .fieldUnavailable }
+
+        // A focused AppKit text field forwards the accessibility write to its field editor.
+        let edited = AXUIElementSetAttributeValue(field, kAXValueAttribute as CFString, password as CFString)
+        return edited == .success ? .filled : .editingUnavailable
+    }
+
+    private func focusedWindow(_ window: AXUIElement, in app: AXUIElement) -> Bool {
+        attribute(app, kAXFrontmostAttribute).value as? Bool == true &&
+            sameElement(window, in: app, attribute: kAXFocusedWindowAttribute)
+    }
+
+    private func sameElement(_ expected: AXUIElement, in app: AXUIElement, attribute name: String) -> Bool {
+        guard let observed = attribute(app, name).value else { return false }
+        return CFEqual(expected, observed)
     }
 
     private func passwordField(in window: AXUIElement) -> AXUIElement? {
