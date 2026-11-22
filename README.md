@@ -3,7 +3,7 @@
 A desktop utility for macOS and Windows that fills the password field in the official KakaoTalk app. You click **Log In** yourself.
 
 <p>
-  <a href="https://github.com/djaxodnjs1234/talk-password-fill/releases/download/v0.1.0-preview/TalkPasswordFill-macOS-Preview.zip"><img src="docs/macos-download.png" width="184" alt="Download macOS preview"></a>
+  <a href="https://github.com/djaxodnjs1234/talk-password-fill/releases/download/v0.1.1-preview/TalkPasswordFill-macOS-v0.1.1-Preview.zip"><img src="docs/macos-download.png" width="184" alt="Download macOS preview"></a>
   <a href="https://github.com/djaxodnjs1234/talk-password-fill/releases/download/v0.2.1-preview/TalkPasswordFill-Windows-x64-v0.2.1-Preview.zip"><img src="docs/windows-download.png" width="184" alt="Download Windows x64 preview"></a>
 </p>
 
@@ -17,9 +17,9 @@ A desktop utility for macOS and Windows that fills the password field in the off
 
 ### macOS 13 or later
 
-1. Unzip the download, move **Talk Password Fill** to **Applications**, and open it.
-2. Save your KakaoTalk password. Enable **Talk Password Fill** in **System Settings → Privacy & Security → Accessibility**.
-3. Open KakaoTalk and click **Log In** when the field is filled. Enable **Launch at Mac Login** from the **Talk Fill** menu to start the helper automatically.
+1. If upgrading, quit the old helper. Unzip the download, move **Talk Password Fill** to **Applications**, and open it.
+2. Enable **Talk Password Fill** in **System Settings → Privacy & Security → Accessibility**. Save your KakaoTalk password if prompted.
+3. Bring the KakaoTalk login window to the front. Once the helper fills the field, click **Log In**. Enable **Launch at Mac Login** from the **Talk Fill** menu to start the helper automatically.
 
 The preview is ad hoc signed. macOS may show a first-launch prompt. [Apple app-opening guide](https://support.apple.com/102445)
 

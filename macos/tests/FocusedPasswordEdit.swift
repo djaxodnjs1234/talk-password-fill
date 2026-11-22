@@ -11,6 +11,7 @@ final class FocusedPasswordEdit: NSObject, NSApplicationDelegate, NSTextFieldDel
     private let field = NSSecureTextField(frame: NSRect(x: 20, y: 58, width: 280, height: 24))
     private let login = NSButton(frame: NSRect(x: 20, y: 20, width: 90, height: 24))
     private var editCount = 0
+    private var ranTest = false
 
     static func main() {
         let fixture = FocusedPasswordEdit()
@@ -32,14 +33,20 @@ final class FocusedPasswordEdit: NSObject, NSApplicationDelegate, NSTextFieldDel
         window.makeKeyAndOrderFront(nil)
         window.makeFirstResponder(account)
         NSApp.activate(ignoringOtherApps: true)
+        scheduleVerification()
         DispatchQueue.main.asyncAfter(deadline: .now() + 30) {
             self.fail("Bring the Test Login window forward to run the fixture.")
         }
     }
 
     func applicationDidBecomeActive(_ notification: Notification) {
+        scheduleVerification()
+    }
+
+    private func scheduleVerification() {
         DispatchQueue.main.async {
-            guard NSApp.isActive, self.window.isVisible else { return }
+            guard NSApp.isActive, self.window.isVisible, !self.ranTest else { return }
+            self.ranTest = true
             self.window.makeKey()
             self.window.makeFirstResponder(self.account)
             self.verify()
