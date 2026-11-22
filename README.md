@@ -4,7 +4,7 @@ A desktop utility for macOS and Windows that fills the password field in the off
 
 <p>
   <a href="https://github.com/djaxodnjs1234/talk-password-fill/releases/download/v0.1.0-preview/TalkPasswordFill-macOS-Preview.zip"><img src="docs/macos-download.png" width="184" alt="Download macOS preview"></a>
-  <a href="https://github.com/djaxodnjs1234/talk-password-fill/releases/download/v0.2.0-preview/TalkPasswordFill-Windows-x64-Preview.zip"><img src="docs/windows-download.png" width="184" alt="Download Windows x64 preview"></a>
+  <a href="https://github.com/djaxodnjs1234/talk-password-fill/releases/download/v0.2.1-preview/TalkPasswordFill-Windows-x64-v0.2.1-Preview.zip"><img src="docs/windows-download.png" width="184" alt="Download Windows x64 preview"></a>
 </p>
 
 ## What it looks like
@@ -25,9 +25,9 @@ The preview is ad hoc signed. macOS may show a first-launch prompt. [Apple app-o
 
 ### Windows 11 x64
 
-1. Unzip the download to a permanent folder, such as `%LOCALAPPDATA%\Programs\TalkPasswordFill`.
-2. Run **TalkPasswordFill.exe**, save your password, and leave **Launch at Windows sign-in** selected.
-3. Open KakaoTalk and click **Log In** when the field is filled.
+1. If upgrading, quit the old helper from the notification area. Use **Extract All** and keep the extracted files together in a permanent folder.
+2. Open **TalkPasswordFill.exe** and click **Save settings** with **Launch at Windows sign-in** selected. Leave the password box blank if a saved password already exists.
+3. Open the KakaoTalk login window. The helper shows its status in settings. When prompted, clear KakaoTalk’s password field and click **Fill now** in the helper. Click **Log In** in KakaoTalk when ready.
 
 The Windows preview is unsigned. Live validation of autofill after Windows sign-in and after KakaoTalk logout is pending. [Windows verification checklist](windows/README.md)
 
