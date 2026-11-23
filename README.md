@@ -23,6 +23,8 @@ A desktop utility for macOS and Windows that fills the password field in the off
 
 The preview is ad hoc signed. macOS may show a first-launch prompt. [Apple app-opening guide](https://support.apple.com/102445)
 
+If autofill stops after an update and **Talk Password Fill** is already enabled in Accessibility, remove the old entry and add the current app from **Applications** using **+**.
+
 ### Windows 11 x64
 
 1. If upgrading, quit the old helper from the notification area. Use **Extract All** and keep the extracted files together in a permanent folder.
